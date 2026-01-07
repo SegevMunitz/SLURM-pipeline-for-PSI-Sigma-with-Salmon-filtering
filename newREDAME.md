@@ -88,7 +88,7 @@ sbatch sbatch_03_make_groups.slurm
 ---
 
 **Step 4: Gene Counting (Optional)**
-Runs `featureCounts` across all generated BAM files to create a raw count matrix and a "clean" matrix formatted for PSI-Sigma.
+Runs `featureCounts` across all generated BAM files to create a raw count matrix and a gene-level count matrix for optional differential expression analysis (not used by PSI-Sigma).
 ```bash
 sbatch sbatch_04_featurecounts.slurm
 ```
@@ -126,23 +126,27 @@ The pipeline maintains a strict, predictable hierarchy:
 
 ```
 OUTDIR/
-├── samples.txt              # List of sample IDs
-├── groups.tsv               # User-provided mapping
-├── star_index/              # STAR Genome Index
-├── bam/                     # Per-sample alignment results
+├── samples.txt                         # List of sample IDs
+├── groups.tsv                          # User-provided mapping
+├── star_index/                         # STAR Genome Index
+├── bam/                                # Per-sample alignment results
 │   └── Sample_01/
 │       ├── Sample_01.Aligned.sortedByCoord.out.bam
 │       └── Sample_01.Aligned.sortedByCoord.out.bam.bai
-├── groups/                  # BAM path lists for PSI-Sigma
+├── groups/                             # BAM path lists for PSI-Sigma
 │   ├── Healthy.bams.txt
 │   └── Sick.bams.txt
-├── counts/                  # featureCounts matrices
+├── counts/                             # featureCounts matrices
 │   └── gene_counts.matrix.tsv
-├── logs/                    # SLURM stdout/stderr
-└── Comparison_Name/         # PSI-Sigma splicing results
-    ├── ES_results.txt       # Exon Skipping
-    ├── IR_results.txt       # Intron Retention
-    └── ...
+├── logs/                               # SLURM stdout/stderr
+└── Comparison_Name/                    # PSI-Sigma splicing results
+    ├── PSIsigma_r10_ir3.sorted.txt     # Filtered Results (p<0.01)
+    ├── PSIsigma_r10_ir3.txt            # Unfiltered Results
+    ├── *.SJ.out.tab                    # Junction Read File
+    ├── *.IR.out.tab                    # Intergenic Read File  
+    ├── *.db                            # PSI-Sigma Database
+    ├── *.bam                           # BAM File
+    └── *.gtf                           # GTF File
 ```
 
 ---
