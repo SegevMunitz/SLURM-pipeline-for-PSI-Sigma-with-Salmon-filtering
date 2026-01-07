@@ -125,10 +125,16 @@ sbatch --dependency=afterok:$STAR_ID sbatch_05_run_psi_sigma.slurm
 The pipeline maintains a strict, predictable hierarchy:
 
 ```
+star_indexes/                           # STAR Genome Index
+    ├── Human                           # Human Genome Index
+        └── Genecode_v45_rl100          # Format for human genomes
+        └── ...
+    └── Mouse                           # Mouse Genome Index
+        └── Genecode_m38_rl100          # Format for mouse genomes
+        └── ...
 OUTDIR/
 ├── samples.txt                         # List of sample IDs
 ├── groups.tsv                          # User-provided mapping
-├── star_index/                         # STAR Genome Index
 ├── bam/                                # Per-sample alignment results
 │   └── Sample_01/
 │       ├── Sample_01.Aligned.sortedByCoord.out.bam
