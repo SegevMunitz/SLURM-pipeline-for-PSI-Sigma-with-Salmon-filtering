@@ -1,222 +1,107 @@
-
+#!/usr/bin/env python3
 """
-step2_fastq_preprocessing.py
+step3_make_group_files.py
 
-Utilities for FASTQ quality control (QC) and optional read trimming prior to
-downstream analysis (e.g., STAR alignment, Salmon, kallisto).
+Create PSI-Sigma group files (lists of BAM paths) after STAR alignment.
 
-This module provides a small, explicit preprocessing layer that can be inserted
-at the beginning of an RNA-seq pipeline. It supports:
-  - FastQC + MultiQC on raw FASTQs
-  - Optional adapter/quality trimming with fastp
-  - FastQC + MultiQC on trimmed FASTQs
-  - Returning the FASTQ paths that should be used downstream
+What this script does
+---------------------
+Given:
+  1) an output root directory (OUTDIR) that contains STAR outputs in:
+       <OUTDIR>/bam/<sample>/<sample>.Aligned.sortedByCoord.out.bam
+  2) a samples file:
+       <OUTDIR>/samples.txt
+     containing one sample ID per line (the same IDs used in paths.SAMPLES / step1 prep)
+  3) a mapping TSV file:
+       groups.tsv
+     with exactly 2 tab-separated columns per line:
+       <sample_id>    <group_name>
 
-The goal is to make QC and trimming decisions explicit, reproducible, and easy
-to enable or disable.
+This script writes, for each group_name, a file:
+  <OUTDIR>/groups/<group_name>.bams.txt
 
-Overview
---------
-Given a list of samples (each with an ID and FASTQ paths), the typical flow is:
+Each output file contains absolute BAM file paths, one per line. These files can be
+passed directly to PSI-Sigma as group inputs (e.g., --groupa /path/to/Healthy.bams.txt).
 
-  FASTQ
-    → FastQC + MultiQC (raw)
-    → [optional] fastp trimming
-    → [optional] FastQC + MultiQC (trimmed)
-    → FASTQs ready for alignment / quantification
-
-No alignment or quantification is performed in this module.
-
-Functions
----------
-1) fastqc_multiqc(...)
-   Runs FastQC on a list of FASTQ files and aggregates the results with MultiQC.
-
-2) fastp_trim(...)
-   Runs fastp on one sample (single-end or paired-end), producing trimmed FASTQs
-   and fastp HTML/JSON reports.
-
-3) process_fastqs(...)
-   High-level orchestrator that:
-     - validates FASTQ paths
-     - runs QC on raw FASTQs (optional)
-     - trims reads with fastp (optional)
-     - runs QC on trimmed FASTQs (optional)
-     - returns the FASTQ paths to use downstream
-
-Key design decisions
+Important usage note
 --------------------
-- QC and trimming are optional and controlled by flags (`do_qc`, `do_trim`).
-- Trimming is NOT automatic; it must be explicitly enabled.
-- QC on trimmed reads is only run if trimming was performed.
-- All external tools (fastqc, multiqc, fastp) are checked via `which_or_die`
-  before execution.
-- The module returns FASTQ paths rather than writing global state, allowing
-  clean integration into downstream pipeline stages.
+Run this as a SINGLE job after the STAR array has completed successfully.
+Do NOT run it inside the STAR per-sample array task, because you can get partial
+group files while alignment is still running.
 
-Input data model
-----------------
-Samples are provided as a list of dictionaries with the following keys:
-
-  {
-    "id": "sample_name",
-    "r1": "/path/to/sample_R1.fastq.gz",
-    "r2": "/path/to/sample_R2.fastq.gz",   # optional (omit or set to None for SE)
-  }
-
-Single-end samples are supported by omitting the "r2" field.
-
-Output layout
--------------
-All outputs are written under `out_root`:
-
-  out_root/
-    qc_raw/            FastQC + MultiQC reports for raw FASTQs (if enabled)
-    qc_trimmed/        FastQC + MultiQC reports for trimmed FASTQs (if enabled)
-    trimmed_fastq/     Trimmed FASTQs and fastp reports (if trimming enabled)
-
-Trimming outputs per sample:
-  <sample>.R1.trimmed.fastq.gz
-  <sample>.R2.trimmed.fastq.gz   (paired-end only)
-  <sample>.fastp.html
-  <sample>.fastp.json
-
-Return value
-------------
-process_fastqs(...) returns a dictionary:
-
-  {
-    sample_id: (Path_to_R1, Path_to_R2_or_None),
-    ...
-  }
-
-If trimming is disabled, the returned paths point to the original FASTQs.
-If trimming is enabled, the returned paths point to the trimmed FASTQs.
-
-When to use this module
-----------------------
-- At the start of a new RNA-seq analysis
-- When working with new sequencing data or a new sequencing facility
-- When you want explicit QC reports for documentation or publication
-- When you want trimming to be reproducible and optional
-
-When NOT to use trimming
-------------------------
-- If FASTQs were already trimmed by the sequencing provider
-- If FastQC on raw data shows clean adapter content and high base quality
-- If you need strict comparability with a previous analysis that did not trim
-
-Examples
---------
-Basic usage with QC only:
-  trimmed = process_fastqs(
-      samples=samples,
-      out_root=Path("qc"),
-      threads=8,
-      do_qc=True,
-      do_trim=False,
-  )
-
-QC + trimming:
-  trimmed = process_fastqs(
-      samples=samples,
-      out_root=Path("qc"),
-      threads=8,
-      do_qc=True,
-      do_trim=True,
-  )
-
-Downstream integration:
-  for sid, (r1, r2) in trimmed.items():
-      run_star(sample_id=sid, r1=r1, r2=r2)
-
-Notes
------
-- This module does not modify FASTQs in place.
-- STAR and other modern aligners tolerate minor low-quality bases, so trimming
-  should be driven by QC results, not habit.
-- All heavy lifting is delegated to external, well-established tools.
+Exit conditions / validation
+----------------------------
+- If a mapping line does not have exactly 2 TSV columns -> exits with error.
+- If a mapped sample has no BAM file at the expected location -> exits with error.
+- If a mapped sample is not present in samples.txt -> prints WARNING to stderr
+  (but still includes it in the group; BAM existence is still enforced).
 """
 
 from __future__ import annotations
+
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-from utils import ensure_dir, run, which_or_die
+import argparse
+import sys
+from paths import (OUTDIR)
 
-def fastqc_multiqc(fastqs: List[Path], out_dir: Path, threads: int, label: str) -> None:
-    which_or_die("fastqc")
-    which_or_die("multiqc")
-    qc_dir = out_dir / f"qc_{label}"
-    ensure_dir(qc_dir)
-    run(["fastqc", "-t", str(threads), "-o", str(qc_dir)] + [str(fq) for fq in fastqs])
-    run(["multiqc", str(qc_dir), "-o", str(qc_dir)])
+def bam_path(out_dir: Path, sample: str) -> Path:
+    """
+    Construct the expected STAR BAM path for a given sample.
 
-def fastp_trim(
-    sample_id: str,
-    r1: Path,
-    r2: Optional[Path],
-    out_dir: Path,
-    threads: int,
-) -> Tuple[Path, Optional[Path]]:
-    which_or_die("fastp")
-    ensure_dir(out_dir)
+    Returns the canonical location under the pipeline output directory:
+      <out_dir>/bam/<sample>/<sample>.Aligned.sortedByCoord.out.bam
+    """
+    return out_dir / "bam" / sample / f"{sample}.Aligned.sortedByCoord.out.bam"
 
-    out_r1 = out_dir / f"{sample_id}.R1.trimmed.fastq.gz"
-    out_r2 = out_dir / f"{sample_id}.R2.trimmed.fastq.gz" if r2 else None
-    html = out_dir / f"{sample_id}.fastp.html"
-    js = out_dir / f"{sample_id}.fastp.json"
 
-    cmd = ["fastp", "-w", str(threads), "-i", str(r1), "-o", str(out_r1), "-h", str(html), "-j", str(js)]
-    if r2:
-        cmd += ["-I", str(r2), "-O", str(out_r2)]
-    run(cmd)
+def main() -> None:
+    """
+    Create group-specific BAM list files from sample-to-group mappings.
 
-    return out_r1, out_r2
+    Reads sample IDs and group assignments, validates BAM existence, and
+    writes one BAM list file per group under <OUTDIR>/groups for downstream
+    PSI-Sigma analysis.
+    """
 
-def process_fastqs(
-    samples: List[Dict],
-    out_root: Path,
-    threads: int,
-    do_qc: bool,
-    do_trim: bool,
-) -> Dict[str, Tuple[Path, Optional[Path]]]:
-    # Validate inputs
-    for s in samples:
-        if not Path(s["r1"]).exists():
-            raise SystemExit(f"ERROR: missing R1 for {s['id']}: {s['r1']}")
-        if s.get("r2") and not Path(s["r2"]).exists():
-            raise SystemExit(f"ERROR: missing R2 for {s['id']}: {s['r2']}")
+    out_dir = OUTDIR / "star_alignments"
+    samples_txt = OUTDIR / "samples.txt" 
+    groups_tsv = out_dir / "groups.tsv"
+    groups_dir = out_dir / "groups"
+    groups_dir.mkdir(parents=True, exist_ok=True)
 
-    # QC raw
-    if do_qc:
-        raw_fastqs: List[Path] = []
-        for s in samples:
-            raw_fastqs.append(Path(s["r1"]))
-            if s.get("r2"):
-                raw_fastqs.append(Path(s["r2"]))
-        fastqc_multiqc(raw_fastqs, out_root, threads, "raw")
+    # read samples
+    samples = [ln.strip() for ln in samples_txt.read_text().splitlines() if ln.strip()]
+    sample_set = set(samples)
 
-    # Trim (or passthrough)
-    trimmed: Dict[str, Tuple[Path, Optional[Path]]] = {}
-    trim_dir = out_root / "trimmed_fastq"
+    # read mapping
+    mapping_lines = [ln.strip() for ln in groups_tsv.read_text().splitlines() if ln.strip()]
+    group_to_samples: dict[str, list[str]] = {}
+    for ln in mapping_lines:
+        parts = ln.split("\t")
+        if len(parts) != 2:
+            raise SystemExit(f"Bad mapping line (need 2 TSV columns): {ln}")
+        s, g = parts[0].strip(), parts[1].strip()
+        if s not in sample_set:
+            print(f"WARNING: mapping sample not in samples.txt: {s}", file=sys.stderr)
+        group_to_samples.setdefault(g, []).append(s)
 
-    for s in samples:
-        sid = s["id"]
-        r1 = Path(s["r1"])
-        r2 = Path(s["r2"]) if s.get("r2") else None
+    # write group files
+    written = []
+    for group, ss in group_to_samples.items():
+        p = groups_dir / f"{group}.bams.txt"
+        bams = []
+        for s in ss:
+            b = bam_path(out_dir, s)
+            if not b.is_file():
+                raise SystemExit(f"Missing BAM for group={group} sample={s}: {b}")
+            bams.append(str(b.resolve()))
+        p.write_text("\n".join(bams) + "\n")
+        written.append(p)
 
-        if do_trim:
-            trimmed[sid] = fastp_trim(sid, r1, r2, trim_dir, threads)
-        else:
-            trimmed[sid] = (r1, r2)
+    print("Wrote group files:")
+    for p in written:
+        print("  ", p)
 
-    # QC trimmed
-    if do_qc and do_trim:
-        t_fastqs: List[Path] = []
-        for sid, (r1, r2) in trimmed.items():
-            t_fastqs.append(r1)
-            if r2:
-                t_fastqs.append(r2)
-        fastqc_multiqc(t_fastqs, out_root, threads, "trimmed")
 
-    return trimmed
+if __name__ == "__main__":
+    main()
