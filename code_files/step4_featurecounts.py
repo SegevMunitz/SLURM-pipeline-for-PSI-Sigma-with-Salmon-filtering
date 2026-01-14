@@ -1,104 +1,32 @@
-
+#!/usr/bin/env python3
 """
 step4_featurecounts.py
 
-Gene-level read counting from aligned RNA-seq BAM files using Subread
-`featureCounts`, plus conversion of the output into a clean count matrix TSV
-suitable for downstream tools (e.g., Psi-Sigma).
+Run featureCounts on STAR-aligned BAMs and produce a PSI-Sigma-friendly count matrix.
 
-This module assumes we have:
-  - One BAM file per sample (typically STAR-aligned, coordinate-sorted)
-  - A matching gene annotation GTF file for the same genome build
+This step aggregates per-sample alignments into gene-level read counts using
+Subread's featureCounts. It is intended to run after alignment has completed
+and the output directory contains:
+    <OUT_ROOT>/bam/<sample>/<sample>.Aligned.sortedByCoord.out.bam
 
-Overview
---------
-The main workflow implemented here is:
+The script can either:
+  - auto-discover BAMs under <OUT_ROOT>/bam/*/*.Aligned.sortedByCoord.out.bam, or
+  - accept one or more BAMs explicitly via repeated --bam arguments.
 
-  BAM files (per sample)
-    → featureCounts (gene-level exon counting)
-    → featureCounts.gene_counts.txt (raw featureCounts output)
-    → gene_counts.matrix.tsv (clean matrix: gene_id + sample columns)
+Outputs are written under:
+    <OUT_ROOT>/counts/
+including:
+  - featureCounts.gene_counts.txt   (raw featureCounts output)
+  - gene_counts.matrix.tsv          (cleaned matrix)
 
-The returned output is the cleaned matrix file path.
+The "clean" matrix is produced by removing featureCounts metadata columns
+(Chr, Start, End, Strand, Length) and renaming the Geneid column to gene_id,
+while preserving the sample count columns for downstream differential analysis.
 
-Key behaviors
--------------
-- Uses featureCounts to count reads overlapping exons (`-t exon`) and summarize
-  counts by gene ID (`-g gene_id`).
-- Supports strandedness via the `stranded` argument (passed to `-s`).
-- Supports paired-end counting when `paired_end=True` by enabling:
-    -p  : count fragments instead of reads
-    -B  : require both ends to be successfully aligned
-    -C  : exclude chimeric fragments
-
-Outputs
--------
-All outputs are written under:
-  <out_root>/counts/
-
-Files created:
-  1) featureCounts.gene_counts.txt
-     The standard featureCounts output file, including annotation columns
-     (Chr/Start/End/Strand/Length) plus one column per BAM/sample.
-
-  2) gene_counts.matrix.tsv
-     A simplified tab-delimited matrix intended for downstream differential
-     expression / splicing tools. It contains:
-       - a first column named "gene_id"
-       - one column per sample (derived from the BAM paths in the featureCounts run)
-     and excludes featureCounts annotation columns.
-
-Functions
----------
-featurecounts_gene_counts(...)
-    Runs featureCounts on a list of BAMs and writes:
-      - featureCounts.gene_counts.txt (raw)
-      - gene_counts.matrix.tsv (clean)
-    Returns the path to the cleaned matrix.
-
-make_clean_counts_matrix(featurecounts_out, clean_out)
-    Parses the raw featureCounts output and writes a cleaned matrix:
-      - skips initial comment lines beginning with '#'
-      - keeps the header row and data rows
-      - drops featureCounts annotation columns:
-          Chr, Start, End, Strand, Length
-      - renames "Geneid" to "gene_id"
-    Writes the result as a tab-separated TSV.
-
-Arguments and conventions
--------------------------
-- bams: list of BAM file paths to include as columns in the count matrix.
-- annotation_gtf: GTF file used for read assignment; must match genome build.
-- threads: number of CPU threads for featureCounts (-T).
-- stranded: featureCounts strandedness flag (-s):
-    0 = unstranded
-    1 = stranded
-    2 = reversely stranded
-- paired_end: if True, enable fragment counting with -p -B -C.
-
-Example usage
--------------
-Count genes from STAR BAMs (paired-end, unstranded):
-  matrix = featurecounts_gene_counts(
-      bams=[Path("sample1.bam"), Path("sample2.bam")],
-      annotation_gtf=Path("gencode.gtf"),
-      out_root=Path("analysis_out"),
-      threads=12,
-      stranded=0,
-      paired_end=True,
-  )
-  print("Counts matrix:", matrix)
-
-Notes / assumptions
--------------------
-- featureCounts must be installed and discoverable on PATH.
-- BAMs should be coordinate-sorted and indexed for best performance (indexing
-  is not strictly required by featureCounts but is standard in pipelines).
-- The cleaned matrix keeps only gene_id and sample count columns; any additional
-  metadata columns from featureCounts are removed to simplify downstream tools.
-- Column names for samples come from the featureCounts header (often BAM paths).
-  If your downstream tool requires short sample IDs, consider renaming columns
-  after generation or extend `make_clean_counts_matrix` to map names.
+Requirements
+------------
+- featureCounts must be available on PATH (module load / conda environment).
+- The provided --annotation-gtf should match the genome used for alignment.
 """
 
 from __future__ import annotations
@@ -106,7 +34,7 @@ import argparse
 import csv
 from pathlib import Path
 from typing import List
-
+from paths import (OUTDIR, ANNOTATION_GTF)
 from utils import ensure_dir, run, which_or_die
 
 def featurecounts_gene_counts(
@@ -117,6 +45,13 @@ def featurecounts_gene_counts(
     stranded: int,
     paired_end: bool,
 ) -> Path:
+    """
+    Run featureCounts on the provided BAMs and write outputs under out_root/counts.
+
+    Produces the raw featureCounts output file and then generates a cleaned
+    tab-delimited matrix (gene_counts.matrix.tsv) suitable for PSI-Sigma.
+    Returns the path to the cleaned matrix file.
+    """
     which_or_die("featureCounts")
     out_dir = out_root / "counts"
     ensure_dir(out_dir)
@@ -142,6 +77,13 @@ def featurecounts_gene_counts(
     return matrix
 
 def make_clean_counts_matrix(featurecounts_out: Path, clean_out: Path) -> None:
+    """
+    Convert raw featureCounts output into a compact gene-by-sample count matrix.
+
+    Skips comment lines, identifies the header row, drops featureCounts metadata
+    columns (Chr/Start/End/Strand/Length), and renames Geneid -> gene_id.
+    Writes the resulting TSV matrix to clean_out.
+    """
     with open(featurecounts_out, "r", encoding="utf-8") as f_in, \
          open(clean_out, "w", encoding="utf-8", newline="") as f_out:
         
@@ -172,15 +114,27 @@ def make_clean_counts_matrix(featurecounts_out: Path, clean_out: Path) -> None:
 
 
 def find_star_bams(out_root: Path) -> List[Path]:
+    """
+    Discover STAR-sorted BAMs under the pipeline output directory.
+
+    Searches for files matching:
+      <out_root>/bam/*/*.Aligned.sortedByCoord.out.bam
+    Returns a sorted list of Paths for reproducible ordering.
+    """
     bams = sorted(out_root.glob("bam/*/*.Aligned.sortedByCoord.out.bam"))
     return [Path(b) for b in bams]
 
 def main() -> None:
+    """
+    Parse CLI args, collect BAM inputs, and run featureCounts end-to-end.
+
+    Either uses user-specified --bam paths or auto-discovers BAMs under out-root.
+    Runs featureCounts and writes both raw output and a cleaned PSI-Sigma matrix
+    under <out-root>/counts, then prints a short completion summary.
+    """
     p = argparse.ArgumentParser(
         description="Run featureCounts and generate a clean gene counts matrix for Psi-Sigma."
     )
-    p.add_argument("--out-root", type=Path, required=True, help="Pipeline output root containing bam/ directory.")
-    p.add_argument("--annotation-gtf", type=Path, required=True, help="Annotation GTF used for counting.")
     p.add_argument("--threads", type=int, default=12)
     p.add_argument("--stranded", type=int, default=0, choices=[0, 1, 2], help="featureCounts -s (0/1/2)")
     p.add_argument("--paired-end", action="store_true", help="Enable featureCounts paired-end flags: -p -B -C")
@@ -193,21 +147,21 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    out_root = args.out_root.resolve()
-    ensure_dir(out_root)
+    out_dir = OUTDIR
+    ensure_dir(out_dir)
 
-    bams = args.bam if args.bam else find_star_bams(out_root)
+    bams = args.bam if args.bam else find_star_bams(out_dir)
     if not bams:
         raise SystemExit(
             f"ERROR: No BAMs found.\n"
             f"Either pass --bam multiple times, or ensure BAMs exist under:\n"
-            f"  {out_root/'bam'}/*/*.Aligned.sortedByCoord.out.bam"
+            f"  {out_dir/'bam'}/*/*.Aligned.sortedByCoord.out.bam"
         )
 
     matrix = featurecounts_gene_counts(
         bams=bams,
-        annotation_gtf=args.annotation_gtf,
-        out_root=out_root,
+        annotation_gtf=ANNOTATION_GTF,
+        out_root=out_dir,
         threads=args.threads,
         stranded=args.stranded,
         paired_end=args.paired_end,
