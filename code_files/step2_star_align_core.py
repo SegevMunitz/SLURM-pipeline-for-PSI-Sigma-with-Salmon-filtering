@@ -1,100 +1,36 @@
 #!/usr/bin/env python3
-
 """
-step1_star_align.py
+step2_star_align_core.py
 
-Run STAR alignment for paired-end FASTQ samples using an existing STAR genome index.
-Designed to mirror a typical SLURM-array bash workflow.
+Per-sample STAR alignment worker for SLURM arrays.
 
-This script does NOT build the index. Use step0_get_star_index.py to build the index first.
+This script is designed to be executed as part of a SLURM array job, where each
+array task aligns exactly one sample selected from a samples list file
+(e.g., <OUTDIR>/samples.txt). The selected sample ID is determined by either:
+  - --task-id (1-based), or
+  - SLURM_ARRAY_TASK_ID (1-based) if --task-id is not provided.
 
-Core behavior (per selected sample)
------------------------------------
-1) Selects a sample name from a samples file (one sample per line).
-   - Uses --task-id if provided (1-based).
-   - Otherwise uses SLURM_ARRAY_TASK_ID (1-based).
-2) Constructs paired-end FASTQ paths:
-       R1 = <fastq-dir>/<sample><r1-suffix>
-       R2 = <fastq-dir>/<sample><r2-suffix>
-   Defaults:
-       r1-suffix = "_1.fastq.gz"
-       r2-suffix = "_2.fastq.gz"
-3) Creates output directories:
-       <out-dir>/logs/
-       <out-dir>/bam/<sample>/
-       <out-dir>/tmp/
-4) Creates a unique temp directory per run and passes it to STAR:
-       <out-dir>/tmp/<sample>.tmp_<jobid>_<taskid>
-   If it already exists, it is removed and recreated (like `rm -rf` in bash).
-5) Runs STAR with parameters matching the bash defaults:
-       --runThreadN <threads>
-       --outSAMtype BAM SortedByCoordinate
-       --outFilterIntronMotifs RemoveNoncanonical
-       --outBAMsortingThreadN 4
-       --genomeDir <index-dir>
-       --twopassMode Basic
-       --readFilesCommand zcat        (optional; can be disabled)
-       --readFilesIn <R1> <R2>
-       --outFileNamePrefix <out-dir>/bam/<sample>/<sample>.
-       --outTmpDir <tmp-dir>
-6) Verifies the expected BAM exists:
-       <out-dir>/bam/<sample>/<sample>.Aligned.sortedByCoord.out.bam
-7) Indexes the BAM:
-       samtools index <bam>
+Sample definitions are loaded from paths.SAMPLES, where each entry must include:
+  - "id": unique sample identifier (must match a line in samples.txt)
+  - "r1": path to R1 FASTQ
+  - "r2": optional path to R2 FASTQ (may be None for single-end)
 
-Thread selection
-----------------
-- If --threads is provided, it is used.
-- Else SLURM_CPUS_PER_TASK is used if set.
+Outputs are written under the provided --out-dir:
+  - <OUTDIR>/bam/<sample>/<sample>.Aligned.sortedByCoord.out.bam
+  - <OUTDIR>/bam/<sample>/<sample>.Aligned.sortedByCoord.out.bam.bai
+  - <OUTDIR>/logs/ (directory created; STAR logs are written in sample folder via prefix)
+  - <OUTDIR>/tmp/<sample>.tmp_<jobid>_<taskid> (unique temp per task)
 
-CLI arguments
--------------
-Required:
-  --genome-dir PATH
-  --fastq-dir PATH
-  --out-dir PATH
-  --samples PATH
+STAR is executed with parameters chosen to match typical pipeline defaults:
+  - Sorted BAM output (SortedByCoordinate)
+  - Two-pass mode (Basic)
+  - Noncanonical intron motif filtering
+  - Optional readFilesCommand (zcat by default; auto-disabled if R1 is not .gz)
 
-Optional:
-  --task-id INT          1-based line number in samples file
-  --threads INT
-  --r1-suffix STR
-  --r2-suffix STR
-  --tmp-base PATH
-
-STAR parameter overrides (optional):
-  --twopassMode STR
-  --outFilterIntronMotifs STR
-  --outBAMsortingThreadN INT
-  --readFilesCommand STR   Set to empty string to disable (for uncompressed FASTQ)
-
-Examples
---------
-SLURM array usage (task id inferred from environment):
-  python star_align.py \\
-    --genome-dir /indexes/mm10_rl100 \\
-    --fastq-dir /data/fastq \\
-    --out-dir /results/star_out \\
-    --samples /results/star_out/samples.txt
-
-Local single task:
-  python star_align.py \\
-    --genome-dir /indexes/mm10_rl100 \\
-    --fastq-dir /data/fastq \\
-    --out-dir /results/star_out \\
-    --samples /results/star_out/samples.txt \\
-    --task-id 3 \\
-    --threads 12
-
-Uncompressed FASTQ:
-  python star_align.py \\
-    --genome-dir /indexes/mm10_rl100 \\
-    --fastq-dir /data/fastq \\
-    --out-dir /results/star_out \\
-    --samples /results/star_out/samples.txt \\
-    --readFilesCommand ""
+This script expects STAR and samtools to be available on PATH (module load or conda
+activation should happen in the sbatch script). It performs basic validation
+(FASTQ existence; BAM creation) and fails fast if required inputs/outputs are missing.
 """
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -102,10 +38,16 @@ import argparse
 import os
 import socket
 
-from paths import SAMPLES
+from paths import (SAMPLES, STAR_INDEX_DIR, OUTDIR)
 from utils import ensure_dir, run, which_or_die
 
 def get_sample_info(sample_id: str):
+    """
+    Look up a sample record in paths.SAMPLES by its sample ID.
+
+    Returns the full sample metadata dict (including r1/r2 paths) used by the
+    alignment worker. Exits with a clear error if the sample ID is not found.
+    """
     for s in SAMPLES:
         if s["id"] == sample_id:
             return s
@@ -115,6 +57,13 @@ def get_sample_info(sample_id: str):
     )
 
 def read_sample_from_list(samples_file: Path, task_id_1based: int) -> str:
+    """
+    Read the sample ID corresponding to a 1-based task index from a samples file.
+
+    Mimics the SLURM-array pattern `sed -n "${SLURM_ARRAY_TASK_ID}p"`, selecting
+    exactly one line and returning it as the sample ID. Validates index bounds
+    and rejects empty/blank lines to prevent silent misalignment.
+    """
     if task_id_1based < 1:
         raise SystemExit(f"ERROR: task id must be >= 1 (got {task_id_1based})")
     lines = samples_file.read_text().splitlines()
@@ -129,11 +78,25 @@ def read_sample_from_list(samples_file: Path, task_id_1based: int) -> str:
 
 
 def samtools_index(bam: Path) -> None:
+    """
+    Create a BAM index (.bai) for the given BAM file using samtools.
+
+    Verifies samtools is available on PATH and runs `samtools index`.
+    This is typically required for downstream tools (e.g., PSI-Sigma) that
+    expect indexed BAMs.
+    """
     which_or_die("samtools")
     run(["samtools", "index", str(bam)])
 
 
 def build_tmp_dir(tmp_base: Path, sample: str, job_id: str, task_id: str) -> Path:
+    """
+    Create a unique per-task STAR temporary directory under the output root.
+
+    The temp path encodes sample, SLURM job id, and task id to avoid collisions.
+    If the directory already exists (e.g., rerun), it is removed and recreated
+    to mimic a clean `rm -rf` behavior before STAR runs.
+    """
     tmp = tmp_base / f"{sample}.tmp_{job_id}_{task_id}"
     if tmp.exists():
         # be safe like your bash
@@ -144,12 +107,19 @@ def build_tmp_dir(tmp_base: Path, sample: str, job_id: str, task_id: str) -> Pat
 
 
 def main() -> None:
+    """
+    Execute STAR alignment for a single sample (one SLURM array task).
+
+    Parses CLI arguments, resolves the task/sample ID, validates FASTQ inputs,
+    constructs STAR command-line parameters, runs STAR, verifies the BAM output,
+    and indexes the BAM using samtools for downstream analysis.
+    """
     p = argparse.ArgumentParser(description="Run STAR alignment per-sample.")
 
     # Core IO
-    p.add_argument("--genome-dir", type=Path, required=True, help="STAR index directory.")
-    p.add_argument("--out-dir", type=Path, required=True)
-    p.add_argument("--samples", type=Path, required=True, help="Text file with one sample per line.")
+    genome_dir: Path = STAR_INDEX_DIR
+    out_dir: Path = OUTDIR / "star_alignments"
+    samples: Path = OUTDIR / "samples.txt"
 
     # Sample/task selection
     p.add_argument("--task-id", type=int, default=None, help="1-based line number in --samples. If omitted, uses SLURM_ARRAY_TASK_ID.")
@@ -159,14 +129,12 @@ def main() -> None:
     # Threads
     p.add_argument("--threads", type=int, default=None, help="If none given, uses SLURM_CPUS_PER_TASK.")
 
-    # STAR params matching bash defaults, chnage if wanted other then default
+    # STAR params matching bash defaults, change if wanted other then default
     p.add_argument("--twopassMode", type=str, default="Basic")
     p.add_argument("--outFilterIntronMotifs", type=str, default="RemoveNoncanonical")
     p.add_argument("--outBAMsortingThreadN", type=int, default=4)
     p.add_argument("--readFilesCommand", type=str, default="zcat", help="Set to '' to disable (for uncompressed FASTQ).")
 
-    # Temp + prefix layout
-    p.add_argument("--tmp-base", type=Path, default=None, help="Base tmp directory. Default: <out-dir>/tmp")
     args = p.parse_args()
 
     # Resolve STAR executable
@@ -186,10 +154,9 @@ def main() -> None:
     if threads is None:
         threads = int(os.environ.get("SLURM_CPUS_PER_TASK", "4"))
 
-    out_dir: Path = args.out_dir
     logs_dir = out_dir / "logs"
     bam_root = out_dir / "bam"
-    tmp_base = args.tmp_base or (out_dir / "tmp")
+    tmp_base = out_dir / "tmp"
 
     ensure_dir(logs_dir)
     ensure_dir(bam_root)
@@ -201,12 +168,12 @@ def main() -> None:
     host = socket.gethostname()
     print(f"=== job={job_id} task={array_id} host={host} ===")    
     print(f"STAR={star_cmd}")
-    print(f"IDX={args.genome_dir}")
+    print(f"IDX={genome_dir}")
     print(f"OUT={out_dir}")
-    print(f"SAMPLES={args.samples}")
+    print(f"SAMPLES={samples}")
     print(f"Threads={threads}")
 
-    sample = read_sample_from_list(args.samples, task_id)
+    sample = read_sample_from_list(samples, task_id)
 
     rec = get_sample_info(sample)
     r1 = Path(rec["r1"])
@@ -233,20 +200,23 @@ def main() -> None:
         "--outSAMtype", "BAM", "SortedByCoordinate",
         "--outFilterIntronMotifs", args.outFilterIntronMotifs,
         "--outBAMsortingThreadN", str(args.outBAMsortingThreadN),
-        "--genomeDir", str(args.genome_dir),
+        "--genomeDir", str(genome_dir),
         "--twopassMode", args.twopassMode,
-        "--readFilesIn", str(r1),
         "--outFileNamePrefix", str(prefix),
         "--outTmpDir", str(tmp),
     ]
+    
+    read_files = [str(r1)]
 
     if r2 is not None:
-        cmd.insert(cmd.index("--outFileNamePrefix"), str(r2))  # place r2 right after r1
+        read_files.append(str(r2))
+    
+    cmd += ["--readFilesIn", *read_files]
 
     if args.readFilesCommand.strip():
-        cmd.insert(cmd.index("--readFilesIn"), "--readFilesCommand")
-        cmd.insert(cmd.index("--readFilesIn"), args.readFilesCommand)
-
+        i = cmd.index("--readFilesIn")
+        cmd[i:i] = ["--readFilesCommand", args.readFilesCommand]
+        
     print(f"--- START STAR sample={sample} ---")
     run(cmd)
     print(f"--- END STAR sample={sample} ---")
