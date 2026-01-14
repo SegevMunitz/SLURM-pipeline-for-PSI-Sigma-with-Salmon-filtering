@@ -1,87 +1,74 @@
-
+#!/usr/bin/env python3
 """
 helper_step0_build_star_index.py
 
-Build a STAR genome index (reference) directory, optionally downloading missing
-reference inputs (genome FASTA and annotation GTF) from user-provided URLs.
+Prepare a STAR genome reference index for RNA-seq alignment.
 
-This script is intended to be the "reference preparation" step that you run once
-per (genome FASTA, annotation GTF, read length) combination. It will skip work if
-the index output directory already appears to contain a STAR index.
+This script builds a STAR genome index from a reference genome FASTA and
+an annotation GTF file, optionally downloading missing inputs from user-provided
+URLs. It is designed to be run once per reference genome and read length, and
+the resulting index can then be reused across multiple alignment jobs.
 
-Behavior
---------
-1) Verifies that STAR is available on PATH.
-2) Ensures genome FASTA and annotation GTF exist:
-   - If a file is missing and BOTH a download URL and --download-dir are provided,
-     it downloads the file into:
-        <download-dir>/<basename-of-requested-file>
-   - If a file is missing and no URL/download-dir is provided, exits with an error.
-3) Creates the index directory if needed.
-4) Skips index generation if the sentinel file "<index-dir>/Genome" exists.
-5) Runs STAR genome generation:
-       STAR --runMode genomeGenerate
-            --genomeDir <index-dir>
-            --genomeFastaFiles <genome-fasta>
-            --sjdbGTFfile <annotation-gtf>
-            --sjdbOverhang <read_length - 1>
-            --runThreadN <threads>
+The script performs the following high-level steps:
+  1) Verifies that the STAR executable is available in the environment.
+  2) Checks that the genome FASTA and annotation GTF files exist locally.
+     - If a required file is missing and both a download URL and a download
+       directory are provided, the file is downloaded automatically.
+     - If a required file is missing and no download information is provided,
+       the script exits with an error.
+  3) Creates the STAR index output directory if it does not already exist.
+  4) Detects whether a STAR index is already present (via the 'Genome' sentinel
+     file) and skips index generation if so.
+  5) Runs STAR in genomeGenerate mode using parameters appropriate for the
+     specified read length.
 
-Important Notes
----------------
-- sjdbOverhang should match sequencing read length (typically read_length - 1).
-  If you align reads of a different length than the index was built for, junction
-  annotation performance can degrade. Keep separate indices per read length.
-- This script does not decompress .gz inputs; provide inputs in the format STAR
-  expects in your environment or extend the script to decompress.
+The STAR index is generated with a splice junction database overhang
+(sjdbOverhang) of (read_length - 1), which should match the read length of the
+RNA-seq data that will be aligned. For best results, separate STAR indices
+should be generated for datasets with different read lengths.
 
-Command-line Interface (CLI)
-----------------------------
-Required:
-  --genome-fasta PATH
-  --annotation-gtf PATH
-  --index-dir PATH
-  --read-length INT
+This script does not modify or decompress input files; genome FASTA and GTF
+inputs must be provided in a format supported by STAR in the target environment.
 
-Optional:
-  --threads INT
-  --download-dir PATH
-  --genome-url URL
-  --annotation-url URL
-
-Examples
---------
-Build an index from local files:
-  python star_get_index.py \\
-    --genome-fasta /refs/mm10.fa \\
-    --annotation-gtf /refs/gencode.mm10.gtf \\
-    --index-dir /indexes/mm10_rl100 \\
-    --read-length 100 \\
-    --threads 12
-
-Download missing inputs then build:
-  python star_get_index.py \\
-    --genome-fasta GRCh38.primary_assembly.genome.fa.gz \\
-    --annotation-gtf gencode.v44.annotation.gtf.gz \\
-    --index-dir /indexes/GRCh38_rl150 \\
-    --read-length 150 \\
-    --threads 12 \\
-    --download-dir /refs \\
-    --genome-url "https://..." \\
-    --annotation-url "https://..."
+Typical usage is as a preparatory step in an RNA-seq pipeline, executed prior
+to any alignment jobs and reused across multiple samples and Slurm array runs.
 """
 
-#!/usr/bin/env python3
+
 from __future__ import annotations
 
 from pathlib import Path
 import argparse
 import urllib.request
+import shutil
+import gzip
 
 from utils import ensure_dir, run, which_or_die
 
 def download_if_missing(url: str, dest: Path) -> None:
+    """
+    Download a file from a URL if it does not already exist.
+
+    If URL ends with .gz and dest does NOT end with .gz, download to dest.gz
+    and decompress to dest.
+    """
     ensure_dir(dest.parent)
+
+    # Case: want uncompressed dest but URL is gz
+    if url.endswith(".gz") and not str(dest).endswith(".gz"):
+        gz_path = dest.with_suffix(dest.suffix + ".gz")  # e.g. .fa -> .fa.gz
+        if dest.exists():
+            return
+        if not gz_path.exists():
+            print(f"Downloading {url} -> {gz_path}")
+            urllib.request.urlretrieve(url, gz_path)
+
+        print(f"Decompressing {gz_path} -> {dest}")
+        with gzip.open(gz_path, "rb") as fin, dest.open("wb") as fout:
+            shutil.copyfileobj(fin, fout)
+        return
+
+    # Normal download (dest matches URL)
     if dest.exists():
         return
     print(f"Downloading {url} -> {dest}")
@@ -98,6 +85,14 @@ def build_star_index(
     genome_url: str | None = None,
     annotation_url: str | None = None,
 ) -> None:
+    """
+    Build a STAR genome index for a given genome and annotation.
+
+    Verifies STAR availability, ensures FASTA and GTF inputs exist (optionally
+    downloading them), and runs STAR genomeGenerate with parameters appropriate
+    for the specified read length. Skips index creation if an existing index
+    is detected in the output directory.
+    """
     which_or_die("STAR")
 
     # If missing, optionally download to download_dir/<original filename>
@@ -136,6 +131,13 @@ def build_star_index(
 
 
 def main() -> None:
+    """
+    Parse command-line arguments and invoke STAR index generation.
+    
+    Handles user input validation and forwards all parameters to
+    build_star_index(), which performs the actual reference preparation.
+    Intended to be called once per genome / annotation / read-length setup.
+    """
     p = argparse.ArgumentParser(description="Build STAR genome index (optionally download FASTA/GTF).")
     p.add_argument("--genome-fasta", type=Path, required=True)
     p.add_argument("--annotation-gtf", type=Path, required=True)
