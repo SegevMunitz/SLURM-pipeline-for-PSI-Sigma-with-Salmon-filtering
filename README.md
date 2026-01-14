@@ -543,7 +543,7 @@ If a step fails:
 
 ### Contact & Support
 For issues related to:
-- **PSI-Sigma:** See PSI-Sigma documentation
+- **PSI-Sigma:** [PSI-Sigma GitHub](https://github.com/wososa/PSI-Sigma)
 - **STAR:** [STAR GitHub](https://github.com/alexdobin/STAR)
 - **Salmon:** [Salmon documentation](https://salmon.readthedocs.io/)
 
@@ -551,3 +551,4 @@ For issues related to:
 
 **Pipeline Version:** 2.0  
 **Last Updated:** January 2025
+
