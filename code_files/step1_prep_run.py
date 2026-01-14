@@ -1,119 +1,122 @@
-
-"""
-step0_prep_run.py
-
-Preparation step for a scalable SLURM-based RNA-seq alignment workflow.
-
-This script performs the one-time setup work needed before launching a STAR
-alignment SLURM array. It does NOT run alignment itself.
-
-What it does
-------------
-1) Creates the pipeline output directory (paths.OUTDIR).
-2) Writes a samples list file:
-       <OUTDIR>/samples.txt
-   containing one sample ID per line, taken from paths.SAMPLES[*]["id"].
-   This file is consumed by the STAR SLURM-array worker
-   (e.g., step1_star_align_core.py) which uses SLURM_ARRAY_TASK_ID to select
-   which sample to process.
-
-3) Builds a STAR genome index (if it does not already exist) by calling
-   build_star_index(...) with paths-provided configuration:
-     - paths.GENOME_FASTA
-     - paths.ANNOTATION_GTF
-     - paths.STAR_INDEX_DIR
-     - paths.THREADS
-     - paths.READ_LENGTH
-
-Expected inputs (from paths.py)
--------------------------------
-Required variables in paths.py:
-  OUTDIR: Path
-      Output root for the run (will be created if missing).
-
-  SAMPLES: list[dict]
-      Each dict must include at least:
-        {"id": <sample_id>, "r1": <path>, "r2": <path or None>}
-      Only the "id" field is used by this script; r1/r2 are used later.
-
-  GENOME_FASTA: Path
-      Reference genome FASTA used for STAR index generation.
-
-  ANNOTATION_GTF: Path
-      Gene annotation GTF used for STAR index generation.
-
-  STAR_INDEX_DIR: Path
-      Directory where the STAR index will be created (or reused).
-
-  THREADS: int
-      Threads for STAR genomeGenerate.
-
-  READ_LENGTH: int
-      Read length used to compute sjdbOverhang = READ_LENGTH - 1 for index generation.
-
-Outputs
--------
-Creates/updates:
-  <OUTDIR>/samples.txt
-      One sample ID per line.
-
-Creates (if not already present):
-  <STAR_INDEX_DIR>/
-      STAR index files (sentinel typically <STAR_INDEX_DIR>/Genome).
-
-How this fits in the SLURM workflow
------------------------------------
-Typical run order:
-  1) Submit this script as a single SLURM job (prep).
-  2) Submit the STAR alignment SLURM array, pointing at:
-        --samples <OUTDIR>/samples.txt
-  3) After the array completes, submit a final aggregation job (e.g., featureCounts).
-
-Example SLURM usage
--------------------
-In a prep SLURM script:
-  python step_prep_run.py
-
-Then launch the alignment array:
-  python step1_star_align_core.py \
-    --samples <OUTDIR>/samples.txt \
-    --fastq-dir <FASTQ_DIR> \
-    --genome-dir <STAR_INDEX_DIR> \
-    --out-dir <OUTDIR>
-
-Notes
------
-- This script assumes the STAR index build step is safe to run multiple times;
-  build_star_index(...) should skip if the index already exists.
-- This script does not validate FASTQ paths; that validation happens in later steps.
-- Ensure the sample IDs in samples.txt match the FASTQ naming convention expected
-  by your alignment worker (or pass --r1-suffix/--r2-suffix accordingly).
-"""
 #!/usr/bin/env python3
+"""
+step1_prep_run.py
+
+Preparation and initialization step for a SLURM-based RNA-seq alignment pipeline.
+
+This script performs all one-time setup tasks required before launching a
+STAR alignment SLURM array. It is responsible for preparing the output
+directory structure, defining the set of samples to be processed, and
+ensuring that the required STAR genome index exists.
+
+Specifically, this script:
+  1) Creates the pipeline output root directory defined in paths.OUTDIR.
+  2) Writes a canonical samples list file:
+         <OUTDIR>/samples.txt
+     containing one sample ID per line. This file defines the iteration
+     space for the downstream SLURM array via SLURM_ARRAY_TASK_ID.
+  3) Invokes STAR genome index generation using configuration provided in
+     paths.py. If an index already exists, the build step is skipped.
+
+All configuration is centralized in paths.py, allowing downstream pipeline
+steps to rely on a consistent definition of sample identifiers, reference
+files, and output locations.
+
+Expected configuration (paths.py)
+---------------------------------
+Required variables:
+
+  OUTDIR : Path
+      Root output directory for the pipeline run.
+
+  SAMPLES : list[dict]
+      List of sample metadata dictionaries. Each entry must contain an "id"
+      field. FASTQ paths are not validated here and are used in later steps.
+
+  GENOME_FASTA : Path
+      Reference genome FASTA for STAR index generation.
+
+  ANNOTATION_GTF : Path
+      Gene annotation GTF for STAR index generation.
+
+  STAR_INDEX_DIR : Path
+      Directory where the STAR genome index will be created or reused.
+
+  THREADS : int
+      Number of threads to use for STAR genome index generation.
+
+  READ_LENGTH : int
+      Sequencing read length used to compute sjdbOverhang (READ_LENGTH - 1).
+
+Generated outputs
+-----------------
+  <OUTDIR>/
+      Pipeline output root directory.
+
+  <OUTDIR>/samples.txt
+      One sample ID per line, consumed by the STAR SLURM array worker.
+
+  <STAR_INDEX_DIR>/
+      STAR genome index files, created if not already present.
+
+Workflow context
+----------------
+Typical execution order:
+
+  1) Run this script once to prepare the analysis.
+  2) Submit the STAR alignment SLURM array, using samples.txt to distribute work.
+  3) Run downstream aggregation and analysis steps after alignment completes.
+
+This separation ensures that reference preparation and sample bookkeeping
+are performed once, while alignment and downstream processing scale cleanly
+across samples using SLURM arrays.
+"""
 
 from __future__ import annotations
-from pathlib import Path
 
-import paths
+from paths import (OUTDIR, SAMPLES, STAR_INDEX_DIR, GENOME_FASTA,
+                   ANNOTATION_GTF, THREADS, READ_LENGTH, REF_BUNDLE_DIR,
+                   GENOME_URL, ANNOTATION_URL, SALMON_INDEX_DIR, SALMON_BIN,
+                   TRANSCRIPTS_URL, SALMON_TRANSCRIPTS_FASTA)
 from utils import ensure_dir, write_text
 from helper_step0_build_star_index import build_star_index
+from helper_step1_build_salmon_index import build_salmon_index
 
 def main() -> None:
-    out = paths.OUTDIR.resolve()
+    """
+    Prepare the pipeline output directory and reference resources.
+    
+    Creates the run output directory, writes samples.txt for downstream
+    SLURM array jobs, and ensures a STAR genome index exists by invoking
+    the reference build step if needed.
+    """
+    out = OUTDIR.resolve()
     ensure_dir(out)
 
     # samples.txt for the SLURM array worker (one sample ID per line)
     samples_txt = out / "samples.txt"
-    write_text(samples_txt, "\n".join([str(s["id"]) for s in paths.SAMPLES]) + "\n")
+    write_text(samples_txt, "\n".join([str(s["id"]) for s in SAMPLES]) + "\n")
     print(f"Wrote: {samples_txt}")
 
-    # Build index (one-time)
+    # Build STAR index (one-time)
     build_star_index(
-        genome_fasta=paths.GENOME_FASTA,
-        annotation_gtf=paths.ANNOTATION_GTF,
-        star_index_dir=paths.STAR_INDEX_DIR,
-        threads=paths.THREADS,
-        read_length=paths.READ_LENGTH,
+        genome_fasta=GENOME_FASTA,
+        annotation_gtf=ANNOTATION_GTF,
+        star_index_dir=STAR_INDEX_DIR,
+        threads=THREADS,
+        read_length=READ_LENGTH,
+        download_dir=REF_BUNDLE_DIR,
+        genome_url=GENOME_URL,
+        annotation_url=ANNOTATION_URL
+    )
+
+    # Build Salmon index (one-time)
+    build_salmon_index(
+        transcripts_fasta=SALMON_TRANSCRIPTS_FASTA,
+        salmon_index_dir=SALMON_INDEX_DIR,
+        threads=THREADS,
+        download_dir=REF_BUNDLE_DIR,
+        transcripts_url=TRANSCRIPTS_URL
     )
 
     print("Prep done.")
