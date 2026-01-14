@@ -200,14 +200,6 @@ sbatch --array=1-$N%8 sbatch_02_star_array.slurm
 
 **Output location:** `<OUTDIR>/star_alignments/bam/<sample>/<sample>.Aligned.sortedByCoord.out.bam`
 
-**Note:** There is an inconsistency in the code - `step2_star_align_core.py` writes BAMs to `<OUTDIR>/star_alignments/bam/` and expects `samples.txt` at `<OUTDIR>/star_alignments/samples.txt`, but `step1_prep_run.py` creates `samples.txt` at `<OUTDIR>/samples.txt`, and `step3_make_group_files.py` expects BAMs at `<OUTDIR>/bam/`. You may need to create symlinks or manually adjust paths:
-```bash
-# After step 1, create symlinks to fix the mismatch:
-ln -s <OUTDIR>/samples.txt <OUTDIR>/star_alignments/samples.txt
-# After step 2, create symlink for step 3:
-ln -s <OUTDIR>/star_alignments/bam <OUTDIR>/bam
-```
-
 ---
 
 ### Step 3: Experimental Grouping
@@ -224,7 +216,7 @@ sbatch sbatch_03_make_groups.slurm
 
 **What it does:**
 - Reads `groups.tsv` mapping
-- Validates that all samples have BAM files
+- Validates that all samples have BAM files in `<OUTDIR>/star_alignments/bam/`
 - Creates `<OUTDIR>/groups/<group_name>.bams.txt` files with absolute BAM paths
 
 ---
@@ -238,9 +230,14 @@ sbatch sbatch_04_featurecounts.slurm
 ```
 
 **What it does:**
+- Auto-discovers BAMs under `<OUTDIR>/bam/*/*.Aligned.sortedByCoord.out.bam` (or uses explicit `--bam` paths)
 - Counts reads per gene across all samples
 - Generates raw featureCounts output
 - Creates cleaned matrix: `<OUTDIR>/counts/gene_counts.matrix.tsv`
+
+**Note:** If BAMs are in `<OUTDIR>/star_alignments/bam/`, you may need to either:
+- Create a symlink: `ln -s star_alignments/bam <OUTDIR>/bam`
+- Or provide explicit `--bam` arguments to the script
 
 **Note:** This step is independent from PSI-Sigma but useful for differential expression analysis.
 
@@ -364,12 +361,11 @@ STAR Array (2)
 
 ```
 <OUTDIR>/
-├── samples.txt                           # List of sample IDs (created by step1)
+├── samples.txt                           # List of sample IDs (created by step1, used by step2)
 ├── groups.tsv                            # User-provided sample-to-group mapping (you create this)
 │
-├── star_alignments/                      # STAR alignment workspace (created by step2)
-│   ├── samples.txt                      # Expected by step2 (may need symlink from OUTDIR/samples.txt)
-│   ├── bam/                             # Actual BAM output location
+├── star_alignments/                      # STAR alignment outputs (created by step2)
+│   ├── bam/                             # BAM files (accessed by step3)
 │   │   └── <sample>/
 │   │       ├── <sample>.Aligned.sortedByCoord.out.bam
 │   │       ├── <sample>.Aligned.sortedByCoord.out.bam.bai
@@ -379,8 +375,6 @@ STAR Array (2)
 │   │       └── <sample>.SJ.out.tab     # Splice junctions
 │   ├── logs/                            # STAR-specific logs
 │   └── tmp/                             # STAR temporary files
-│
-├── bam/                                  # Expected by step3 (may need symlink to star_alignments/bam)
 │
 ├── groups/                               # BAM path lists for PSI-Sigma (created by step3)
 │   ├── H.bams.txt
@@ -406,14 +400,6 @@ STAR Array (2)
 ├── logs/                                 # General pipeline logs
 └── tmp/                                  # General temporary files
 ```
-
-**Important Note on Directory Structure:**  
-There is a path inconsistency in the codebase:
-- **Step 2 (STAR)** writes BAMs to `<OUTDIR>/star_alignments/bam/` and expects `samples.txt` at `<OUTDIR>/star_alignments/samples.txt`
-- **Step 1 (Prep)** creates `samples.txt` at `<OUTDIR>/samples.txt`
-- **Step 3 (Groups)** expects BAMs at `<OUTDIR>/bam/`
-
-You may need to create symlinks after each step to make the pipeline work correctly. See the Troubleshooting section for details.
 
 ### Reference Directories (External to OUTDIR)
 
@@ -466,23 +452,15 @@ You may need to create symlinks after each step to make the pipeline work correc
   - Check Perl environment: `perl -MPDL -e 'print "OK\n"'`
   - Install missing modules: `cpanm PDL Statistics::R`
 
-### Path Inconsistencies Between Steps
-- **Issue:** Step 2 cannot find `samples.txt` or Step 3 cannot find BAM files
-- **Root cause:** Different steps expect files in different locations:
-  - Step 1 creates: `<OUTDIR>/samples.txt`
-  - Step 2 expects: `<OUTDIR>/star_alignments/samples.txt`
-  - Step 2 creates: `<OUTDIR>/star_alignments/bam/`
-  - Step 3 expects: `<OUTDIR>/bam/`
-- **Solution:** Create symlinks to bridge the gaps:
+### featureCounts Cannot Find BAM Files
+- **Issue:** Step 4 reports "No BAMs found"
+- **Root cause:** featureCounts auto-discovery looks for `<OUTDIR>/bam/*/*.bam`, but BAMs are in `<OUTDIR>/star_alignments/bam/`
+- **Solution 1 (Symlink):**
   ```bash
-  # After step 1 completes:
-  mkdir -p <OUTDIR>/star_alignments
-  ln -s ../samples.txt <OUTDIR>/star_alignments/samples.txt
-  
-  # After step 2 completes:
   ln -s star_alignments/bam <OUTDIR>/bam
   ```
-- **Alternative:** Modify the code to use consistent paths throughout
+- **Solution 2 (Explicit paths):**
+  Modify the sbatch script to pass explicit `--bam` arguments for each sample
 
 ### Missing Group Files
 - **Issue:** Step 3 fails with "groups.tsv not found"
