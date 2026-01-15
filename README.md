@@ -17,15 +17,15 @@ This repository provides a scalable, modular pipeline for processing RNA-seq dat
 
 The pipeline is divided into **seven distinct stages**, each paired with a Python "core" script and a corresponding `.slurm` submission script:
 
-| Step | Script | Description |
-|------|--------|-------------|
-| **1. Prep** | `step1_prep_run.py` | Builds STAR and Salmon indexes, downloads references if needed, and initializes directory structure |
-| **2. Align** | `step2_star_align_core.py` | Aligns FASTQ files to the genome using STAR via SLURM job arrays |
-| **3. Group** | `step3_make_group_files.py` | Organizes BAM files into experimental groups based on `groups.tsv` |
-| **4. Count** | `step4_featurecounts.py` | Generates gene expression count matrix using featureCounts |
+| Step |  Script  | Description |
+|------|----------|-------------|
+| **1. Prep**     | `step1_prep_run.py` | Builds STAR and Salmon indexes, downloads references if needed, and initializes directory structure |
+| **2. Align**    | `step2_star_align_core.py` | Aligns FASTQ files to the genome using STAR via SLURM job arrays |
+| **3. Group**    | `step3_make_group_files.py` | Organizes BAM files into experimental groups based on `groups.tsv` |
+| **4. Count**    | `step4_featurecounts.py` | Generates gene expression count matrix using featureCounts |
 | **5. Splicing** | `step5_run_psi_sigma.py` | Executes PSI-Sigma to find differential splicing events |
-| **6. Salmon** | `step6_salmon_quant_core.py` | Quantifies transcript expression using Salmon via SLURM job arrays |
-| **7. Filter** | `step7_psi_sigma_filtered_by_salmon.py` | Filters PSI-Sigma results based on Salmon TPM thresholds |
+| **6. Salmon**   | `step6_salmon_quant_core.py` | Quantifies transcript expression using Salmon via SLURM job arrays |
+| **7. Filter**   | `step7_psi_sigma_filtered_by_salmon.py` | Filters PSI-Sigma results based on Salmon TPM thresholds |
 
 ---
 
@@ -551,4 +551,5 @@ For issues related to:
 
 **Pipeline Version:** 2.0  
 **Last Updated:** January 2025
+
 
